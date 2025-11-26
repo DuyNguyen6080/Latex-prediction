@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers
+Pillow
+datasets
+nltk
+numpy
+matplotlib
