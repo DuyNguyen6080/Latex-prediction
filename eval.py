@@ -189,6 +189,7 @@ def eval(model, total_tokens, correct_tokens, refs, pred_tokens ):
 
           mask = gt != pad_id
           correct_tokens += (preds[mask] == gt[mask]).sum().item()
+          print(f"Correct tokens so far: {correct_tokens}")
           total_tokens += mask.sum().item()
 
           gt_cpu = gt.cpu().tolist()
