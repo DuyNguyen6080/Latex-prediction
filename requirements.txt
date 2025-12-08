@@ -1,8 +1,10 @@
 torch
 torchvision
+torchaudio
 transformers
-Pillow
 datasets
+pillow
 nltk
-numpy
 matplotlib
+sentencepiece
+

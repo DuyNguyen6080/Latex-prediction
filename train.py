@@ -3,18 +3,21 @@ from torchvision import transforms
 from transformers import AutoTokenizer
 from PIL import Image
 import torch
-import math
 import torch.nn as nn
 import torch.optim as optim
 from datasets import load_dataset
-from nltk.translate.bleu_score import corpus_bleu
-import yaml
-import os
+import time
 import sys
+import matplotlib.pyplot as plt
+from torch.amp import GradScaler
 
+torch.set_float32_matmul_precision("medium")
 ds = load_dataset("deepcopy/MathWriting-human")
-print(ds)
-print(ds["train"][0])
+
+# Fix random seeds
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.cuda.manual_seed_all(42)
 
 # === Data loading & preprocessing ===
 # Trying out padded resizing of handwritten equations to avoid warping them
@@ -41,7 +44,7 @@ class PaddedResize:
 
         return transforms.ToTensor()(canvas)
 
-img_transform = transforms.Compose([PaddedResize(128, 512)])
+img_transform = transforms.Compose([PaddedResize(96, 384)])
 
 class NotesLatexDataset(Dataset):
     def __init__(self, data, tokenizer, transform=None):
@@ -62,46 +65,6 @@ class NotesLatexDataset(Dataset):
 
     def __len__(self): return len(self.data)
 
-
-
-# Try using coding tokenizer to preserve non english characters
-tokenizer = AutoTokenizer.from_pretrained("huggingface/CodeBERTa-small-v1")
-
-train_ds = NotesLatexDataset(ds["train"], tokenizer, img_transform)
-val_ds = NotesLatexDataset(ds["val"], tokenizer, img_transform)
-test_ds = NotesLatexDataset(ds["test"], tokenizer, img_transform)
-def collate_fn(batch):
-    imgs, seqs = zip(*batch)
-    imgs = torch.stack(imgs)
-
-    lengths = [len(s) for s in seqs]
-    max_len = max(lengths)
-
-    # Padded matrix for tokens
-    padded = torch.zeros(len(seqs), max_len, dtype=torch.long)
-    for i, s in enumerate(seqs):
-        padded[i, :lengths[i]] = s
-
-    return imgs, padded, torch.tensor(lengths)
-
-
-train_ds = Subset(train_ds, range(2000))
-train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate_fn)
-val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, collate_fn=collate_fn)
-test_loader = DataLoader(test_ds, batch_size=16, shuffle=False, collate_fn=collate_fn)
-
-train_features, train_labels, c = next(iter(train_loader))
-print(f"Feature batch shape: {train_features.size()}")
-print(f"Labels batch shape: {train_labels.size()}")
-print(f"c: {c.size()}")
-
-
-
-
-
-
-
-
 # === Model definition ===
 class Model(nn.Module):
     def __init__(
@@ -110,7 +73,7 @@ class Model(nn.Module):
         d_model=256,
         num_heads=8,
         num_layers=3,
-        dim_feedforward=512,
+        dim_feedforward=1024,
         pad_id=0,
     ):
         super().__init__()
@@ -119,23 +82,30 @@ class Model(nn.Module):
         # CNN for feature extraction
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
+
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, d_model, kernel_size=3, padding=1),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
         )
 
         self.token_embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
+        self.feature_norm = nn.LayerNorm(d_model)
 
         # Transformer for generation
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
+            dropout=0.1,
             batch_first=True,
         )
 
@@ -152,6 +122,7 @@ class Model(nn.Module):
         batch_len, channels, h, w = feat.shape
         feat = feat.permute(0, 2, 3, 1)
         feat = feat.reshape(batch_len, h * w, channels)
+        feat = self.feature_norm(feat)
         return feat
 
     def forward(self, images, tgt_input):
@@ -162,98 +133,118 @@ class Model(nn.Module):
         logits = self.output(decoded)
         return logits
     
-def train (model: nn.Module, criterion, optimizer, epochs, epoch_loss_arr, losses):
-  for ep in range(1, epochs + 1):
+
+def collate_fn(batch):
+    imgs, seqs = zip(*batch)
+    imgs = torch.stack(imgs)
+
+    lengths = [len(s) for s in seqs]
+    max_len = max(lengths)
+
+    # Padded matrix for tokens
+    padded = torch.zeros(len(seqs), max_len, dtype=torch.long)
+    for i, s in enumerate(seqs):
+        padded[i, :lengths[i]] = s
+
+    return imgs, padded, torch.tensor(lengths)
+
+
+def main(model_name, samples=None):
+    # Try using coding tokenizer to preserve non english characters
+    tokenizer = AutoTokenizer.from_pretrained("huggingface/CodeBERTa-small-v1")
+
+    train_ds = NotesLatexDataset(ds["train"], tokenizer, img_transform)
+
+    if samples:
+        train_ds = Subset(train_ds, torch.randperm(len(train_ds))[:int(samples)].tolist())
+
+
+    train_loader = DataLoader(train_ds,
+                            batch_size=64,
+                            shuffle=True,
+                            collate_fn=collate_fn,
+                            num_workers=2,
+                            pin_memory=True,
+                            persistent_workers=True)
+
+    print("Training model...")
+    # === Training ===
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    model = Model(vocab_size=tokenizer.vocab_size, pad_id=pad_id).to(device)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=0.01)
+
+    epochs = 50
+
+    track_loss = []
+
+    scaler = GradScaler("cuda") if device.type == "cuda" else None
     model.train()
-    running_loss = 0.0
-    total_batches = 0
 
-    for images, target_seq, lengths in train_loader:
-        images = images.to(device)
-        target_seq = target_seq.to(device)
+    for ep in range(1, epochs + 1):
+        last_ep = time.time()
+        running_loss = 0.0
+        total_batches = 0
+        for images, target_seq, _ in train_loader:
+            images = images.to(device)
+            target_seq = target_seq.to(device)
 
-        tgt_input = target_seq[:, :-1]
-        gt = target_seq[:, 1:]
+            optimizer.zero_grad()
 
-        logits = model(images, tgt_input)
-        loss = criterion(logits.reshape(-1, logits.size(-1)), gt.reshape(-1),)
-        losses.append(loss.item())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            tgt_input = target_seq[:, :-1]
+            gt = target_seq[:, 1:]
 
-        running_loss += loss.item()
-        total_batches += 1
+            logits = model(images, tgt_input)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), gt.reshape(-1),)
 
-    epoch_loss = running_loss / max(1, total_batches)
-    epoch_loss_arr.append(epoch_loss)
-    print(f"Epoch {ep}   Loss = {epoch_loss:.4f}")
+            if not scaler:
+                loss.backward()
+                optimizer.step()
+            else:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-#---------loading configured model---------
-def load_config(path):
-    if not os.path.exists(path):
-        print(f"Config file not found: {path}")
-        sys.exit(1)
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
-# === Training ===
+            running_loss += loss.item()
+            total_batches += 1
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-# re-initialize model and analasis variable
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        epoch_loss = running_loss / max(1, total_batches)
+        track_loss.append(epoch_loss)
 
 
+        if ep in {1,2,5,10,15,20,30,40,50,75,100,150,200,300,400,500,1000,1500,2000,2500}:
+            print(f"Epoch {ep}   Loss = {epoch_loss:.4f}   Time: {time.time() - last_ep}")
 
-config = load_config("model_config.yaml")
-print(config)
+        last_ep = time.time()
 
-model_name = config["model_name"]
-model_epochs = config["num_epochs"]
-model_learning_rate = config["learning_rate"]
+    # Graph loss over training
+    plt.figure(figsize=(8, 5))
+    plt.plot(range(1, epochs + 1), track_loss)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss vs Epochs")
+    plt.grid(True)
+    plt.savefig("loss_graphs/" + model_name + ".png", dpi=300, bbox_inches="tight")
+    plt.close()
 
-model = Model(vocab_size=tokenizer.vocab_size, pad_id=pad_id).to(device)
-model.to(device)
-criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-optimizer = optim.Adam(model.parameters(), lr=model_learning_rate)
-epochs = 1
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "pad_id": pad_id,
+            "vocab_size": tokenizer.vocab_size,
+            "tokenizer_name": "huggingface/CodeBERTa-small-v1",
+        },
+        "models/" + model_name + ".pt",
+    )
 
-epoch_loss_arr = []
-losses_arr = []
-train (model, criterion, optimizer, model_epochs, epoch_loss_arr, losses_arr)
-torch.save(
-    {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "pad_id": pad_id,
-        "vocab_size": tokenizer.vocab_size,
-        "tokenizer_name": "huggingface/CodeBERTa-small-v1",
-        "n_epochs": epochs,
-        "epoch_loss_arr": epoch_loss_arr,
-        "losses_arr": losses_arr,
-        
-    },
-    # trained_model.pt trained on subset
-    # trained_model_2.pt trained on full dataset
-    model_name,
-)
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python train.py <model file name (Will be saved in /models directory)> [training set size (Must be <229,864), selects a random subset of training set]")
+    else:
+        model = sys.argv[1]
 
-#plot the loss over time
-
-
-numpy_losses = np.array(losses_arr)
-plt.plot(numpy_losses)
-plt.xlabel("iteration")
-plt.ylabel("Loss")
-plt.title("Loss over each iteration")
-plt.show()
-
-epoch_loss = np.array(epoch_loss_arr)
-plt.plot(epoch_loss)
-plt.xlabel("eposch")
-plt.ylabel("Loss")
-plt.title("Loss over each eposch")
-plt.show()
+        if len(sys.argv) == 3:
+            samples = sys.argv[2]
+        main(model, samples)
