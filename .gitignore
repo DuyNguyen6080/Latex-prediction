@@ -1,3 +1,5 @@
 checkpoint/
 pytorch-env/
 /venv
+models/
+loss_graphs/*
