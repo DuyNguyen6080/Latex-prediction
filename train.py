@@ -1,3 +1,5 @@
+import argparse
+import os
 from torch.utils.data import Subset, DataLoader, Dataset
 from torchvision import transforms
 from transformers import AutoTokenizer
@@ -10,6 +12,7 @@ import time
 import sys
 import matplotlib.pyplot as plt
 from torch.amp import GradScaler
+import yaml
 
 torch.set_float32_matmul_precision("medium")
 ds = load_dataset("deepcopy/MathWriting-human")
@@ -148,16 +151,47 @@ def collate_fn(batch):
 
     return imgs, padded, torch.tensor(lengths)
 
+#---------loading configured model---------
+def load_config(path):
+    if not os.path.exists(path):
+        print(f"Config file not found: {path}")
+        sys.exit(1)
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-def main(model_name, samples=None):
+def main(config):
     # Try using coding tokenizer to preserve non english characters
     tokenizer = AutoTokenizer.from_pretrained("huggingface/CodeBERTa-small-v1")
 
     train_ds = NotesLatexDataset(ds["train"], tokenizer, img_transform)
 
-    if samples:
-        train_ds = Subset(train_ds, torch.randperm(len(train_ds))[:int(samples)].tolist())
+    
+    config_details = load_config(config)
+    model_name = config_details["model_name"]
+    model_epochs = config_details["num_epochs"]
+    model_learning_rate = config_details["learning_rate"]
+    save_dir = config_details["save_dir"]
+    samples = config_details["num_samples"]
+    epochs = model_epochs
+    learning_rate = float(model_learning_rate)
 
+    if samples:
+        if len(train_ds) < samples:
+            print("Number of samplel is greater than dataset\n")
+            exit() 
+        train_ds = Subset(train_ds, torch.randperm(len(train_ds))[:int(samples)].tolist())
+    else: 
+        print("In config file sample must > 0\n")
+        exit()
+    
+    if not os.path.exists(save_dir):
+        # Use os.makedirs() to create the directory(ies). 
+        # 'exist_ok=True' prevents an error if another part of 
+        # your code might also try to create it.
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"Created directory: {save_dir}")
+    
+    print("config learning_rate: {learning_rate}\n")
 
     train_loader = DataLoader(train_ds,
                             batch_size=64,
@@ -167,6 +201,7 @@ def main(model_name, samples=None):
                             pin_memory=True,
                             persistent_workers=True)
 
+    
     print("Training model...")
     # === Training ===
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,9 +209,9 @@ def main(model_name, samples=None):
 
     model = Model(vocab_size=tokenizer.vocab_size, pad_id=pad_id).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    optimizer = optim.Adam(model.parameters(), lr=3e-4, weight_decay=0.01)
+    optimizer = optim.Adam(model.parameters(), learning_rate, weight_decay=0.01)
 
-    epochs = 50
+    
 
     track_loss = []
 
@@ -214,7 +249,7 @@ def main(model_name, samples=None):
         track_loss.append(epoch_loss)
 
 
-        if ep in {1,2,5,10,15,20,30,40,50,75,100,150,200,300,400,500,1000,1500,2000,2500}:
+        if not (ep % 10) :
             print(f"Epoch {ep}   Loss = {epoch_loss:.4f}   Time: {time.time() - last_ep}")
 
         last_ep = time.time()
@@ -229,6 +264,7 @@ def main(model_name, samples=None):
     plt.savefig("loss_graphs/" + model_name + ".png", dpi=300, bbox_inches="tight")
     plt.close()
 
+    
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -243,8 +279,14 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python train.py <model file name (Will be saved in /models directory)> [training set size (Must be <229,864), selects a random subset of training set]")
     else:
-        model = sys.argv[1]
-
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--config", type=str, required=True)
+        
+        args = parser.parse_args()
+        config_file = args.config
+        
         if len(sys.argv) == 3:
-            samples = sys.argv[2]
-        main(model, samples)
+            sample = 1
+            print(f"default num sample set is {sample}")
+            main(config_file)
+        

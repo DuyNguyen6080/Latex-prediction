@@ -1,0 +1,5 @@
+model_name : test
+num_epochs : 50
+learning_rate : 3e-4
+save_dir : check_points/
+num_samples: 1
